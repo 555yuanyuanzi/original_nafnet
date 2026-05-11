@@ -1,9 +1,11 @@
 .DS_Store
 .idea/*
+.tmp_frenet/
 experiments
 logs/
 *results*
 *__pycache__*
+*.log
 *.sh
 datasets
 basicsr.egg-info

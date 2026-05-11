@@ -97,6 +97,7 @@ def init_loggers(opt):
 def create_train_val_dataloader(opt, logger):
     # create train and val dataloaders
     train_loader, val_loader = None, None
+    accum_iter = max(1, int(opt['train'].get('accum_iter', 1)))
     for phase, dataset_opt in opt['datasets'].items():
         if phase == 'train':
             dataset_enlarge_ratio = dataset_opt.get('dataset_enlarge_ratio', 1)
@@ -113,7 +114,8 @@ def create_train_val_dataloader(opt, logger):
 
             num_iter_per_epoch = math.ceil(
                 len(train_set) * dataset_enlarge_ratio /
-                (dataset_opt['batch_size_per_gpu'] * opt['world_size']))
+                (dataset_opt['batch_size_per_gpu'] * opt['world_size'] *
+                 accum_iter))
             total_iters = int(opt['train']['total_iter'])
             total_epochs = math.ceil(total_iters / (num_iter_per_epoch))
             logger.info(
@@ -121,6 +123,8 @@ def create_train_val_dataloader(opt, logger):
                 f'\n\tNumber of train images: {len(train_set)}'
                 f'\n\tDataset enlarge ratio: {dataset_enlarge_ratio}'
                 f'\n\tBatch size per gpu: {dataset_opt["batch_size_per_gpu"]}'
+                f'\n\tGradient accumulation steps: {accum_iter}'
+                f'\n\tEffective batch size per gpu: {dataset_opt["batch_size_per_gpu"] * accum_iter}'
                 f'\n\tWorld size (gpu number): {opt["world_size"]}'
                 f'\n\tRequire iter number per epoch: {num_iter_per_epoch}'
                 f'\n\tTotal epochs: {total_epochs}; iters: {total_iters}.')
@@ -223,10 +227,12 @@ def main():
         f'Start training from epoch: {start_epoch}, iter: {current_iter}')
     data_time, iter_time = time.time(), time.time()
     start_time = time.time()
+    accum_iter = max(1, int(opt['train'].get('accum_iter', 1)))
+    accum_step = 0
 
     # for epoch in range(start_epoch, total_epochs + 1):
     epoch = start_epoch
-    while current_iter <= total_iters:
+    while current_iter < total_iters:
         train_sampler.set_epoch(epoch)
         prefetcher.reset()
         train_data = prefetcher.next()
@@ -234,18 +240,38 @@ def main():
         while train_data is not None:
             data_time = time.time() - data_time
 
-            current_iter += 1
-            if current_iter > total_iters:
+            if current_iter >= total_iters:
                 break
+
+            accum_step += 1
+            update_grad = accum_step == accum_iter
+            next_iter = current_iter + 1
+
             # update learning rate
-            model.update_learning_rate(
-                current_iter, warmup_iter=opt['train'].get('warmup_iter', -1))
+            if accum_step == 1:
+                model.update_learning_rate(
+                    next_iter,
+                    warmup_iter=opt['train'].get('warmup_iter', -1))
             # training
             model.feed_data(train_data, is_val=False)
-            result_code = model.optimize_parameters(current_iter, tb_logger)
+            result_code = model.optimize_parameters(
+                next_iter,
+                tb_logger,
+                accum_iter=accum_iter,
+                accum_step=accum_step,
+                update_grad=update_grad)
             # if result_code == -1 and tb_logger:
             #     print('loss explode .. ')
             #     exit(0)
+
+            data_time = time.time()
+            train_data = prefetcher.next()
+
+            if not update_grad:
+                continue
+
+            current_iter = next_iter
+            accum_step = 0
             iter_time = time.time() - iter_time
             # log
             if current_iter % opt['logger']['print_freq'] == 0:
@@ -277,7 +303,6 @@ def main():
 
             data_time = time.time()
             iter_time = time.time()
-            train_data = prefetcher.next()
         # end of iter
         epoch += 1
 

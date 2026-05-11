@@ -188,8 +188,10 @@ class ImageRestorationModel(BaseModel):
         self.output = (preds / count_mt).to(self.device)
         self.lq = self.origin_lq
 
-    def optimize_parameters(self, current_iter, tb_logger):
-        self.optimizer_g.zero_grad()
+    def optimize_parameters(self, current_iter, tb_logger, accum_iter=1,
+                            accum_step=1, update_grad=True):
+        if accum_step == 1:
+            self.optimizer_g.zero_grad()
 
         if self.opt['train'].get('mixup', False):
             self.mixup_aug()
@@ -234,11 +236,12 @@ class ImageRestorationModel(BaseModel):
 
         l_total = l_total + 0. * sum(p.sum() for p in self.net_g.parameters())
 
-        l_total.backward()
-        use_grad_clip = self.opt['train'].get('use_grad_clip', True)
-        if use_grad_clip:
-            torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 0.01)
-        self.optimizer_g.step()
+        (l_total / accum_iter).backward()
+        if update_grad:
+            use_grad_clip = self.opt['train'].get('use_grad_clip', True)
+            if use_grad_clip:
+                torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 0.01)
+            self.optimizer_g.step()
 
         loss_dict.update(self._collect_gdpm_log_dict())
 
@@ -292,15 +295,14 @@ class ImageRestorationModel(BaseModel):
 
         rank, world_size = get_dist_info()
         if rank == 0:
-            pbar = tqdm(total=len(dataloader), unit='image')
+            pbar = tqdm(total=len(dataloader.dataset), unit='image')
 
         cnt = 0
+        progress_count = 0
 
         for idx, val_data in enumerate(dataloader):
             if idx % world_size != rank:
                 continue
-
-            img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
 
             self.feed_data(val_data, is_val=True)
             if self.opt['val'].get('grids', False):
@@ -312,9 +314,13 @@ class ImageRestorationModel(BaseModel):
                 self.grids_inverse()
 
             visuals = self.get_current_visuals()
-            sr_img = tensor2img([visuals['result']], rgb2bgr=rgb2bgr)
+            batch_size = visuals['result'].size(0)
+            gt_imgs = []
             if 'gt' in visuals:
-                gt_img = tensor2img([visuals['gt']], rgb2bgr=rgb2bgr)
+                gt_imgs = [
+                    tensor2img(visuals['gt'][i], rgb2bgr=rgb2bgr)
+                    for i in range(batch_size)
+                ]
                 del self.gt
 
             # tentative for out of GPU memory
@@ -322,56 +328,70 @@ class ImageRestorationModel(BaseModel):
             del self.output
             torch.cuda.empty_cache()
 
-            if save_img:
-                if sr_img.shape[2] == 6:
-                    L_img = sr_img[:, :, :3]
-                    R_img = sr_img[:, :, 3:]
+            for sample_idx in range(batch_size):
+                img_name = osp.splitext(
+                    osp.basename(val_data['lq_path'][sample_idx]))[0]
+                sr_img = tensor2img(
+                    visuals['result'][sample_idx], rgb2bgr=rgb2bgr)
+                gt_img = gt_imgs[sample_idx] if gt_imgs else None
 
-                    # visual_dir = osp.join('visual_results', dataset_name, self.opt['name'])
-                    visual_dir = osp.join(self.opt['path']['visualization'], dataset_name)
+                if save_img:
+                    if sr_img.shape[2] == 6:
+                        L_img = sr_img[:, :, :3]
+                        R_img = sr_img[:, :, 3:]
 
-                    imwrite(L_img, osp.join(visual_dir, f'{img_name}_L.png'))
-                    imwrite(R_img, osp.join(visual_dir, f'{img_name}_R.png'))
-                else:
-                    if self.opt['is_train']:
+                        visual_dir = osp.join(self.opt['path']['visualization'],
+                                              dataset_name)
 
-                        save_img_path = osp.join(self.opt['path']['visualization'],
-                                                 img_name,
-                                                 f'{img_name}_{current_iter}.png')
-
-                        save_gt_img_path = osp.join(self.opt['path']['visualization'],
-                                                 img_name,
-                                                 f'{img_name}_{current_iter}_gt.png')
+                        imwrite(L_img, osp.join(visual_dir, f'{img_name}_L.png'))
+                        imwrite(R_img, osp.join(visual_dir, f'{img_name}_R.png'))
                     else:
-                        save_img_path = osp.join(
-                            self.opt['path']['visualization'], dataset_name,
-                            f'{img_name}.png')
-                        save_gt_img_path = osp.join(
-                            self.opt['path']['visualization'], dataset_name,
-                            f'{img_name}_gt.png')
+                        if self.opt['is_train']:
 
-                    imwrite(sr_img, save_img_path)
-                    imwrite(gt_img, save_gt_img_path)
+                            save_img_path = osp.join(
+                                self.opt['path']['visualization'], img_name,
+                                f'{img_name}_{current_iter}.png')
 
-            if with_metrics:
-                # calculate metrics
-                opt_metric = deepcopy(self.opt['val']['metrics'])
-                if use_image:
-                    for name, opt_ in opt_metric.items():
-                        metric_type = opt_.pop('type')
-                        self.metric_results[name] += getattr(
-                            metric_module, metric_type)(sr_img, gt_img, **opt_)
-                else:
-                    for name, opt_ in opt_metric.items():
-                        metric_type = opt_.pop('type')
-                        self.metric_results[name] += getattr(
-                            metric_module, metric_type)(visuals['result'], visuals['gt'], **opt_)
+                            save_gt_img_path = osp.join(
+                                self.opt['path']['visualization'], img_name,
+                                f'{img_name}_{current_iter}_gt.png')
+                        else:
+                            save_img_path = osp.join(
+                                self.opt['path']['visualization'], dataset_name,
+                                f'{img_name}.png')
+                            save_gt_img_path = osp.join(
+                                self.opt['path']['visualization'], dataset_name,
+                                f'{img_name}_gt.png')
 
-            cnt += 1
+                        imwrite(sr_img, save_img_path)
+                        if gt_img is not None:
+                            imwrite(gt_img, save_gt_img_path)
+
+                if with_metrics:
+                    # calculate metrics
+                    opt_metric = deepcopy(self.opt['val']['metrics'])
+                    if use_image:
+                        for name, opt_ in opt_metric.items():
+                            metric_type = opt_.pop('type')
+                            self.metric_results[name] += getattr(
+                                metric_module, metric_type)(sr_img, gt_img, **opt_)
+                    else:
+                        for name, opt_ in opt_metric.items():
+                            metric_type = opt_.pop('type')
+                            self.metric_results[name] += getattr(
+                                metric_module, metric_type)(
+                                    visuals['result'][sample_idx:sample_idx + 1],
+                                    visuals['gt'][sample_idx:sample_idx + 1],
+                                    **opt_)
+
+            cnt += batch_size
             if rank == 0:
-                for _ in range(world_size):
-                    pbar.update(1)
-                    pbar.set_description(f'Test {img_name}')
+                update_count = min(batch_size * world_size,
+                                   len(dataloader.dataset) - progress_count)
+                if update_count > 0:
+                    pbar.update(update_count)
+                    progress_count += update_count
+                pbar.set_description(f'Test {img_name}')
         if rank == 0:
             pbar.close()
 
