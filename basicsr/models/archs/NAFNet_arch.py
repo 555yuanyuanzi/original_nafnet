@@ -193,10 +193,9 @@ class NAFNet(nn.Module):
         self.padder_size = 2 ** len(self.encoders)
 
     def _apply_dfpb(self, stage_name, x):
-        module = self.dfpb_modules.get(stage_name)
-        if module is None:
+        if stage_name not in self.dfpb_modules:
             return x
-        return module(x)
+        return self.dfpb_modules[stage_name](x)
 
     def forward(self, inp):
         B, C, H, W = inp.shape
