@@ -21,6 +21,7 @@ from basicsr.models.archs.local_arch import Local_Base
 from basicsr.models.GDPM import GlobalDirectionalPriorModulation
 from basicsr.models.PA import PatchAveraging
 from basicsr.models.dfpb import DualFrequencyProgressiveBlock
+from einops import rearrange
 
 class SimpleGate(nn.Module):
     def forward(self, x):
@@ -42,8 +43,9 @@ class PatchAwareGate(nn.Module):
         return x1 * x2
 
 class NAFBlock(nn.Module):
-    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., use_pa=False, pa_patch_size=8):
+    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., use_pa=False, pa_patch_size=8, use_fft=False):
         super().__init__()
+        self.use_fft = use_fft
         dw_channel = c * DW_Expand
         self.conv1 = nn.Conv2d(in_channels=c, out_channels=dw_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
         self.conv2 = nn.Conv2d(in_channels=dw_channel, out_channels=dw_channel, kernel_size=3, padding=1, stride=1, groups=dw_channel,
@@ -56,11 +58,20 @@ class NAFBlock(nn.Module):
             nn.Conv2d(in_channels=dw_channel // 2, out_channels=dw_channel // 2, kernel_size=1, padding=0, stride=1,
                       groups=1, bias=True),
         )
+        
+        self.patch_size = 8
 
         self.sg = PatchAwareGate(dw_channel // 2, patch_size=pa_patch_size) if use_pa else SimpleGate()
         self.ffn_sg = SimpleGate()
-
+        
         ffn_channel = FFN_Expand * c
+        
+        self.ffn_conv1 = nn.Conv2d(c, ffn_channel, 1, bias=True)  # 原始升维
+        # 可学习频域缩放系数
+        if self.use_fft:
+            self.fft_weight = nn.Parameter(torch.ones((1, ffn_channel, 1, 1, 8, 8//2+1)))
+        self.ffn_conv2 = nn.Conv2d(ffn_channel//2, c, 1, bias=True)  # 原始降维
+        
         self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
         self.conv5 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
 
@@ -72,6 +83,22 @@ class NAFBlock(nn.Module):
 
         self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
         self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+    
+    def apply_fft(self, x):
+        B, C, H, W = x.shape
+        P = self.patch_size
+        # 分块
+        x = rearrange(x, 'b c (h p1) (w p2) -> b c h w p1 p2', p1=P, p2=P)
+        # FFT
+        x_fft = torch.fft.rfft2(x.float())
+        # 可学习频域加权
+        x_fft = x_fft * self.fft_weight
+        # 逆FFT
+        x = torch.fft.irfft2(x_fft, s=(P, P))
+        # 还原
+        x = rearrange(x, 'b c h w p1 p2 -> b c (h p1) (w p2)', p1=P, p2=P)
+        return x
+
 
     def forward(self, inp):
         x = inp
@@ -88,10 +115,18 @@ class NAFBlock(nn.Module):
 
         y = inp + x * self.beta
 
-        x = self.conv4(self.norm2(y))
-        x = self.ffn_sg(x)
-        x = self.conv5(x)
-
+        x = self.norm2(y)
+        
+        if self.use_fft:
+            x = self.ffn_conv1(x) 
+            x = self.apply_fft(x)   
+            x = self.ffn_sg(x)          
+            x = self.ffn_conv2(x)
+        else:
+            x = self.conv4(x)
+            x = self.sg(x)
+            x = self.conv5(x)
+        
         x = self.dropout2(x)
 
         return y + x * self.gamma
@@ -114,6 +149,8 @@ class NAFNet(nn.Module):
         use_dfpb=False,
         dfpb_kwargs=None,
         dfpb_stages=None,
+        use_fft=False,
+        fft_stages=None,
     ):
         super().__init__()
 
@@ -137,6 +174,7 @@ class NAFNet(nn.Module):
         self.downs = nn.ModuleList()
         pa_stages = set(pa_stages or [])
         dfpb_stages = set(dfpb_stages or [])
+        fft_stages = set(fft_stages or [])
         dfpb_kwargs = {} if dfpb_kwargs is None else dict(dfpb_kwargs)
         self.dfpb_modules = nn.ModuleDict()
 
@@ -152,6 +190,7 @@ class NAFNet(nn.Module):
                 channels,
                 use_pa=use_pa and stage_name in pa_stages,
                 pa_patch_size=pa_patch_size,
+                use_fft=use_fft and stage_name in fft_stages,
             )
 
         chan = width
