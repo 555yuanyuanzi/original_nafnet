@@ -87,6 +87,11 @@ class NAFBlock(nn.Module):
     def apply_fft(self, x):
         B, C, H, W = x.shape
         P = self.patch_size
+        pad_h = (P - H % P) % P
+        pad_w = (P - W % P) % P
+        if pad_h != 0 or pad_w != 0:
+            # Ensure height/width are divisible by patch size for FFT blocks.
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
         # 分块
         x = rearrange(x, 'b c (h p1) (w p2) -> b c h w p1 p2', p1=P, p2=P)
         # FFT
@@ -97,6 +102,8 @@ class NAFBlock(nn.Module):
         x = torch.fft.irfft2(x_fft, s=(P, P))
         # 还原
         x = rearrange(x, 'b c h w p1 p2 -> b c (h p1) (w p2)', p1=P, p2=P)
+        if pad_h != 0 or pad_w != 0:
+            x = x[:, :, :H, :W]
         return x
 
 
