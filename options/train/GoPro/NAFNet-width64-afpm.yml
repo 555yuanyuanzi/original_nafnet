@@ -1,6 +1,6 @@
-# python -m basicsr.train -opt options/train/GoPro/NAFNet-width64-pa.yml --launcher none
+# python -m basicsr.train -opt options/train/GoPro/NAFNet-width64-afpm.yml --launcher none
 # general settings
-name: NAFNet-GoPro-width64-PA
+name: NAFNet-GoPro-width64-AFPM
 model_type: ImageRestorationModel
 scale: 1
 num_gpu: 1
@@ -45,10 +45,16 @@ network_g:
   middle_blk_num: 1
   dec_blk_nums: [1, 1, 1, 1]
   use_gdpm: false
-  use_pa: true
-  use_dfpb: false
-  pa_patch_size: 8
-  pa_stages: [enc1, enc2]
+  use_fft: false
+  fft_stages: [enc1, enc2, enc3, dec2, dec3, dec4]
+  use_afpm_refiner: true
+  afpm_refiner_stages: [dec1, dec2, dec3, dec4]
+  afpm_refiner_kwargs:
+    patch_size: 8
+    expansion: 1.0
+    scale_limit: 0.2
+    patch_gate_limit: 0.5
+    channel_gate_limit: 0.25
 
 # path
 path:
@@ -60,7 +66,7 @@ path:
 train:
   optim_g:
     type: AdamW
-    lr: !!float 7e-4
+    lr: !!float 3e-4
     weight_decay: !!float 1e-3
     betas: [0.9, 0.9]
 

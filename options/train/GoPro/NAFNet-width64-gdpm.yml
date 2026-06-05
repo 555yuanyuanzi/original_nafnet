@@ -45,8 +45,6 @@ network_g:
   middle_blk_num: 1
   dec_blk_nums: [1, 1, 1, 1]
   use_gdpm: true
-  use_pa: false
-  use_dfpb: false
 
 # path
 path:

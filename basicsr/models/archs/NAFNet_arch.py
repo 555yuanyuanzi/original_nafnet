@@ -1,4 +1,4 @@
-﻿# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-model. All Rights Reserved.
 # ------------------------------------------------------------------------
 
@@ -19,8 +19,7 @@ import torch.nn.functional as F
 from basicsr.models.archs.arch_util import LayerNorm2d
 from basicsr.models.archs.local_arch import Local_Base
 from basicsr.models.GDPM import GlobalDirectionalPriorModulation
-from basicsr.models.PA import PatchAveraging
-from basicsr.models.dfpb import DualFrequencyProgressiveBlock
+from basicsr.models.afpm_refiner import AFPMFrequencyRefiner
 from einops import rearrange
 
 class SimpleGate(nn.Module):
@@ -29,21 +28,8 @@ class SimpleGate(nn.Module):
         return x1 * x2
 
 
-class PatchAwareGate(nn.Module):
-    def __init__(self, channels, patch_size=8):
-        super().__init__()
-        self.pa = PatchAveraging(patch_size=patch_size)
-        self.patch_size = patch_size
-        self.pa_scale = nn.Parameter(torch.zeros((1, channels, 1, 1)), requires_grad=True)
-
-    def forward(self, x):
-        x1, x2 = x.chunk(2, dim=1)
-        if x1.shape[-2] % self.patch_size == 0 and x1.shape[-1] % self.patch_size == 0:
-            x1 = x1 + self.pa_scale * self.pa(x1)
-        return x1 * x2
-
 class NAFBlock(nn.Module):
-    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., use_pa=False, pa_patch_size=8, use_fft=False):
+    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., use_fft=False):
         super().__init__()
         self.use_fft = use_fft
         dw_channel = c * DW_Expand
@@ -61,7 +47,7 @@ class NAFBlock(nn.Module):
         
         self.patch_size = 8
 
-        self.sg = PatchAwareGate(dw_channel // 2, patch_size=pa_patch_size) if use_pa else SimpleGate()
+        self.sg = SimpleGate()
         self.ffn_sg = SimpleGate()
         
         ffn_channel = FFN_Expand * c
@@ -107,6 +93,7 @@ class NAFBlock(nn.Module):
         return x
 
 
+
     def forward(self, inp):
         x = inp
 
@@ -150,14 +137,11 @@ class NAFNet(nn.Module):
         dec_blk_nums=[],
         use_gdpm=False,
         gdpm_kwargs=None,
-        use_pa=False,
-        pa_patch_size=8,
-        pa_stages=None,
-        use_dfpb=False,
-        dfpb_kwargs=None,
-        dfpb_stages=None,
         use_fft=False,
         fft_stages=None,
+        use_afpm_refiner=False,
+        afpm_refiner_kwargs=None,
+        afpm_refiner_stages=None,
     ):
         super().__init__()
 
@@ -179,27 +163,44 @@ class NAFNet(nn.Module):
         self.middle_blks = nn.ModuleList()
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
-        pa_stages = set(pa_stages or [])
-        dfpb_stages = set(dfpb_stages or [])
         fft_stages = set(fft_stages or [])
-        dfpb_kwargs = {} if dfpb_kwargs is None else dict(dfpb_kwargs)
-        self.dfpb_modules = nn.ModuleDict()
-
-        def register_dfpb(channels, stage_name):
-            if use_dfpb and stage_name in dfpb_stages:
-                self.dfpb_modules[stage_name] = DualFrequencyProgressiveBlock(
-                    channels=channels,
-                    **dfpb_kwargs,
+        afpm_refiner_stages = set(afpm_refiner_stages or [])
+        afpm_refiner_kwargs = {} if afpm_refiner_kwargs is None else dict(afpm_refiner_kwargs)
+        afpm_refiner_stage_kwargs = afpm_refiner_kwargs.pop('stage_kwargs', {})
+        if use_afpm_refiner:
+            invalid_stages = []
+            for stage_name in afpm_refiner_stages:
+                if not stage_name.startswith('dec'):
+                    invalid_stages.append(stage_name)
+                    continue
+                try:
+                    dec_idx = int(stage_name[3:])
+                except ValueError:
+                    invalid_stages.append(stage_name)
+                    continue
+                if dec_idx < 1 or dec_idx > len(dec_blk_nums):
+                    invalid_stages.append(stage_name)
+            if invalid_stages:
+                raise ValueError(
+                    "afpm_refiner_stages only supports valid decoder stage names, "
+                    f"got {invalid_stages}."
                 )
 
+        self.afpm_refiner_modules = nn.ModuleDict()
         def build_block(channels, stage_name):
             return NAFBlock(
                 channels,
-                use_pa=use_pa and stage_name in pa_stages,
-                pa_patch_size=pa_patch_size,
                 use_fft=use_fft and stage_name in fft_stages,
             )
 
+        def register_afpm_refiner(channels, stage_name):
+            if use_afpm_refiner and stage_name in afpm_refiner_stages:
+                kwargs = dict(afpm_refiner_kwargs)
+                kwargs.update(afpm_refiner_stage_kwargs.get(stage_name, {}))
+                self.afpm_refiner_modules[stage_name] = AFPMFrequencyRefiner(
+                    channels=channels,
+                    **kwargs,
+                )
         chan = width
         for stage_idx, num in enumerate(enc_blk_nums, start=1):
             stage_name = f'enc{stage_idx}'
@@ -208,13 +209,11 @@ class NAFNet(nn.Module):
                     *[build_block(chan, stage_name) for _ in range(num)]
                 )
             )
-            register_dfpb(chan, stage_name)
             self.downs.append(
                 nn.Conv2d(chan, 2*chan, 2, 2)
             )
             chan = chan * 2
 
-        register_dfpb(chan, 'middle')
         self.middle_blks = \
             nn.Sequential(
                 *[build_block(chan, 'middle') for _ in range(middle_blk_num)]
@@ -234,14 +233,14 @@ class NAFNet(nn.Module):
                     *[build_block(chan, stage_name) for _ in range(num)]
                 )
             )
-            register_dfpb(chan, stage_name)
+            register_afpm_refiner(chan, stage_name)
 
         self.padder_size = 2 ** len(self.encoders)
 
-    def _apply_dfpb(self, stage_name, x):
-        if stage_name not in self.dfpb_modules:
+    def _apply_afpm_refiner(self, stage_name, x):
+        if stage_name not in self.afpm_refiner_modules:
             return x
-        return self.dfpb_modules[stage_name](x)
+        return self.afpm_refiner_modules[stage_name](x)
 
     def forward(self, inp):
         B, C, H, W = inp.shape
@@ -255,18 +254,17 @@ class NAFNet(nn.Module):
 
         for stage_idx, (encoder, down) in enumerate(zip(self.encoders, self.downs), start=1):
             x = encoder(x)
-            x = self._apply_dfpb(f'enc{stage_idx}', x)
             encs.append(x)
             x = down(x)
 
         x = self.middle_blks(x)
-        x = self._apply_dfpb('middle', x)
 
         for stage_idx, (decoder, up, enc_skip) in enumerate(zip(self.decoders, self.ups, encs[::-1]), start=1):
+            stage_name = f'dec{stage_idx}'
             x = up(x)
             x = x + enc_skip
             x = decoder(x)
-            x = self._apply_dfpb(f'dec{stage_idx}', x)
+            x = self._apply_afpm_refiner(stage_name, x)
 
         x = self.ending(x)
         x = x + inp
